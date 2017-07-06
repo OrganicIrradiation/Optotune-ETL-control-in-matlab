@@ -19,12 +19,17 @@ classdef Optotune < handle
         status;
         response;
         
-        temperature = 0;
-        current = 0; %% in mAmpers
-        max_current = 0; % in mAmpers
+        temperature = NaN;
+        current = NaN; %% in mAmpers
         min_current = 0; % in mAmpers
+        max_current = NaN; % in mAmpers
+        min_current_lim = NaN; % in mAmpers
+        max_current_lim = NaN; % in mAmpers
         calibration = 1;  % in mAmpers/micrometer
+        focal_power = NaN;
+        focal_power_limits = [NaN, NaN];
         
+        mode = NaN;
         modeLowerCurrent = 0;
         modeUpperCurrent = 0;
         modeFrequency = 1;
@@ -41,14 +46,14 @@ classdef Optotune < handle
     methods
         function lens=Optotune(port)
             if (nargin<1)
-                lens.port='COM3';
+                lens.port='/dev/tty.usbmodem41';
             else
                 lens.port = port;
             end
         end
         
         function lens = Open(lens)
-            %% Setting up initial parameters for the com port
+            % Setting up initial parameters for the com port
             lens.etl_port = serial(lens.port);
             lens.etl_port.Baudrate=115200;
             lens.etl_port.StopBits=1;
@@ -57,7 +62,7 @@ classdef Optotune < handle
             fopen(lens.etl_port);
             lens.status = lens.etl_port.Status;   %%% checking if initialization was completed the status should be "open"
             
-            %% Initialize communication
+            % Initialize communication
             fprintf(lens.etl_port, 'Start'); %%% initiating the communication
             lens.last_time_laps = checkStatus(lens);
             %lens.etl_port.BytesAvailable;  %%% checking number of bytes in the response
@@ -67,163 +72,140 @@ classdef Optotune < handle
             end
             
             %get initial information about UpperCurrentLimte and MaxBin;
-            lens = lens.getMaxBin();
             lens = lens.getUpperLimitA();
+            lens = lens.getCurrent();
+            lens = lens.getLowerSoftCurrentLimit();
+            lens = lens.getUpperSoftCurrentLimit();
             %Get initial parameters
-            lens.getModeFrequency();
-            lens.getModeLowerCurrent();
-            lens.getModeUpperCurrent();
-            lens.getTemperature();
-
+            lens = lens.getMode();
+            lens = lens.getModeFrequency();
+            lens = lens.getModeLowerCurrent();
+            lens = lens.getModeUpperCurrent();
+            lens = lens.getTemperature();
         end
         
         function lens = getTemperature(lens)
             command = append_crc('TA'-0);
             fwrite(lens.etl_port, command);
             lens.last_time_laps = checkStatus(lens);
-            %pause(lens.time_pause);
-            %lens.etl_port.BytesAvailable;  %%% checking number of bytes in the response
             lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
             x = lens.response(4)*(hex2dec('ff')+1) + lens.response(5);
             lens.temperature = x*0.0625;
         end
         
+        %% Current (in mA) %%
         function lens = getCurrent(lens)
-            %% Get current in mA %%%%%%%%
             command = append_crc(['Ar'-0 0 0]);
             fwrite(lens.etl_port, command);
-            %pause(lens.time_pause);
             lens.last_time_laps = checkStatus(lens);
             lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
-            lens.current = lens.response(2)*(hex2dec('ff')+1) + lens.response(3);
-            lens.current = lens.current * lens.max_current / (lens.max_bin+1);
+            lens.current = bitshift(lens.response(2), 8) + lens.response(3);
+            lens.current = lens.current * lens.max_current/4095;
         end
         
-        function setCurrent(lens, ci) %% Set current in mA via ci variable
-            %% Set current %%%%%%%%
-            set_i = (floor(ci*(lens.max_bin+1) / lens.max_current));
-            LB = mod(set_i,256); %% low byte
-            HB = (set_i-LB)/256; %% high byte
+        function setCurrent(lens, ci, mode)
+            % Set current in mA via ci variable
+            if (nargin < 3) || isempty(mode)
+                mode = 'sync';
+            end
+            if ~strcmp(lens.mode, 'Current')
+                lens = lens.modeCurrent();
+            end
+            set_i = round(ci*(4095/lens.max_current));
+            HB = bitshift(set_i, -8);            
+            LB = bitand(set_i, hex2dec('FF'));
             command = append_crc(['Aw'-0 HB LB]);
-            fwrite(lens.etl_port, command);
-            %pause(lens.time_pause);
+            fwrite(lens.etl_port, command, mode);
         end
         
-        %% setting temperature limits for operation in focal power mode
-        function lens = setTemperatureLimits(lens)
-            % The function has not been finished
-            temp_high = 80/0.0625;  %% Upper limit 80 degrees (see Optotune manual for available limits)
-            temp_low = 0/0.0625;     %% Lower limit 0 degrees
-            LBH = mod(temp_high,256); %% low byte
-            HBH = (temp_high-LBH)/256; %% high byte
-            LBL = mod(temp_low,256); %% low byte
-            HBL = (temp_low-LBL)/256; %% high byte
-            command = append_crc(['PrTA'-0 HBH LBH HBL LBL]);
+        %% Focal power (in D) %%
+        function lens = getFocalPower(lens)
+            command = append_crc(['PrDA'-0 0 0 0 0]);
+            fwrite(lens.etl_port, command);
+            lens.last_time_laps = checkStatus(lens);
+            lens.response = fread(lens.etl_port, lens.etl_port.BytesAvailable);
+            lens.focal_power = bitshift(lens.response(3), 8) + lens.response(4);
+            lens.focal_power = (lens.focal_power/200)-5;
+        end
+        
+        function setFocalPower(lens, di, mode)
+            % Set focal power in D via di variable
+            if (nargin < 3) || isempty(mode)
+                mode = 'sync';
+            end
+            if ~strcmp(lens.mode, 'FocalPower')
+                lens = lens.modeFocalPower();
+            end
+            if di < lens.focal_power_limits(1)
+                warning(sprintf('setFocalPower to value under minimum (requested: %f, minimum: %f)', di, lens.focal_power_limits(1)));
+                di = lens.focal_power_limits(1);
+            elseif di > lens.focal_power_limits(2)
+                warning(sprintf('setFocalPower to value above maximum (requested: %f, maximum: %f)', di, lens.focal_power_limits(2)));
+                di = lens.focal_power_limits(2);
+            end
+            lens.focal_power = di;
+            set_d = round((di+5)*200);
+            HB = bitshift(set_d, -8);
+            LB = bitand(set_d, hex2dec('FF'));
+            command = append_crc(['PwDA'-0 HB LB 0 0]);
+            fwrite(lens.etl_port, command, mode);
+        end
+        
+        %% Temperature limits for operation in focal power mode
+        % Values in degrees celsius
+        function lens = getTemperatureLimits(lens)
+            command = append_crc(['PrTA'-0 0 0 0 0]);
             fwrite(lens.etl_port, command);
             lens.last_time_laps = checkStatus(lens);
             lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
+            disp(lens.response)
+            lens.focal_power_limits(2) = bitshift(lens.response(4), 8) + lens.response(5);
+            lens.focal_power_limits(2) = lens.focal_power_limits(2)/200-5;
+            lens.focal_power_limits(1) = bitshift(lens.response(6), 8) + lens.response(7);
+            lens.focal_power_limits(1) = lens.focal_power_limits(1)/200-5;
         end
         
-        function lens = getMaxBin(lens)
+        function lens = setTemperatureLimits(lens, temps)
+            t_low = temps(1)*16;
+            t_high = temps(2)*16;
+            HHB = bitshift(t_high, -8);
+            HLB = bitand(t_high, hex2dec('FF'));
+            LHB = bitshift(t_low, -8);
+            LLB = bitand(t_low, hex2dec('FF'));
+            command = append_crc(['PwTA'-0 HHB HLB LHB LLB]);
+            fwrite(lens.etl_port, command);
+            lens.last_time_laps = checkStatus(lens);
+            lens.response = fread(lens.etl_port, lens.etl_port.BytesAvailable);
+            lens = getTemperatureLimits(lens);
+        end
+        
+        %% Current limits %%
+        function lens = getLowerSoftCurrentLimit(lens)
+            command = append_crc(['CrLA'-0 0 0]);
+            fwrite(lens.etl_port, command);
+            lens.last_time_laps = checkStatus(lens);
+            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
+            lens.min_current_lim = bitshift(lens.response(4),8) + lens.response(5);
+            lens.min_current_lim = lens.min_current_lim * (lens.max_current/4095);
+        end
+        
+        function lens = getUpperSoftCurrentLimit(lens)
             command = append_crc(['CrUA'-0 0 0]);
             fwrite(lens.etl_port, command);
-            %pause(lens.time_pause);
             lens.last_time_laps = checkStatus(lens);
             lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
-            lens.max_bin = lens.response(4)*(hex2dec('ff')+1) + lens.response(5)+1;  %% hardware current limit usually 4095;
+            lens.max_bin = lens.response(4)*(hex2dec('ff')+1) + lens.response(5)+1;
+            lens.max_current_lim = bitshift(lens.response(4),8) + lens.response(5);
+            lens.max_current_lim = lens.max_current_lim * (lens.max_current/4095);
         end
         
-        %% Get current limit %%%%%%%%
         function lens = getUpperLimitA(lens)
             command = append_crc(['CrMA'-0 0 0]);
             fwrite(lens.etl_port, command);
             lens.last_time_laps = checkStatus(lens);
-            %pause(lens.time_pause);
             lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
             lens.max_current = lens.response(4)*(hex2dec('ff')+1) + lens.response(5);  %% software current limit usually 292.84 mA;
             lens.max_current = lens.max_current / 100; %% reads current in mili ampers
-        end
-        
-        %% set the lens to different mode
-        function lens = currentMode(lens)
-            command = append_crc('MwDA'-0);
-            fwrite(lens.etl_port, command);
-            lens.last_time_laps = checkStatus(lens);
-            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
-            if strcmp(cellstr(char(lens.response(1:3))'), 'MDA')
-                logMessage('Lens set to Current Mode succesfully');
-            else
-                checkError(lens);
-            end
-        end
-        
-        function lens = focalPowerMode(lens)
-            command = append_crc('MwCA'-0);
-            fwrite(lens.etl_port, command);
-            lens.last_time_laps = checkStatus(lens);
-            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
-            if strcmp(cellstr(char(lens.response(1:3))'), 'MCA')
-                logMessage('Lens set to Focal Power Mode succesfully');
-            else
-                checkError(lens);
-            end
-        end
-        
-        function lens = analogMode(lens)
-            command = append_crc('MwAA'-0);
-            fwrite(lens.etl_port, command);
-            lens.last_time_laps = checkStatus(lens);
-            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
-            if strcmp(cellstr(char(lens.response(1:3))'), 'MAA')
-                logMessage('Lens set to Analog Mode succesfully');
-            else
-                checkError(lens);
-            end
-        end
-        
-        function lens = sinusoidalMode(lens)
-            command = append_crc('MwSA'-0);
-            fwrite(lens.etl_port, command);
-            lens.last_time_laps = checkStatus(lens);
-            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
-            if strcmp(cellstr(char(lens.response(1:3))'), 'MSA')
-                logMessage('Lens set to Sinusoidal Signal Mode succesfully');
-            else
-                checkError(lens);
-            end
-            lens = lens.setModeFrequency(lens.modeFrequency);
-            lens = lens.setModeLowerCurrent(lens.modeLowerCurrent);
-            lens = lens.setModeUpperCurrent(lens.modeUpperCurrent);
-        end
-        
-        function lens = rectangularMode(lens)
-            command = append_crc('MwQA'-0);
-            fwrite(lens.etl_port, command);
-            lens.last_time_laps = checkStatus(lens);
-            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
-            if strcmp(cellstr(char(lens.response(1:3))'), 'MQA')
-                logMessage('Lens set to Rectangular Signal Mode succesfully');
-            else
-                checkError(lens);
-            end
-                        lens = lens.setModeFrequency(lens.modeFrequency);
-            lens = lens.setModeLowerCurrent(lens.modeLowerCurrent);
-            lens = lens.setModeUpperCurrent(lens.modeUpperCurrent);
-        end
-        
-        function lens = triangularMode(lens)
-            command = append_crc('MwTA'-0);
-            fwrite(lens.etl_port, command);
-            lens.last_time_laps = checkStatus(lens);
-            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
-            if strcmp(cellstr(char(lens.response(1:3))'), 'MTA')
-                logMessage('Lens set to Triangular Signal Mode succesfully');
-            else
-                checkError(lens);
-            end
-                        lens = lens.setModeFrequency(lens.modeFrequency);
-            lens = lens.setModeLowerCurrent(lens.modeLowerCurrent);
-            lens = lens.setModeUpperCurrent(lens.modeUpperCurrent);
         end
         
         %% get the current mode the lens is running at
@@ -235,19 +217,113 @@ classdef Optotune < handle
             checkError(lens);
             switch lens.response(4)
                 case 1
-                    logMessage('Lens is driven in Current mode');
+                    lens.mode = 'Current';
                 case 2
-                    logMessage('Lens is driven in Sinusoidal Singal mode');
+                    lens.mode = 'Sinusoidal';
                 case 3
-                    logMessage('Lens is driven in Triangular mode');
+                    lens.mode = 'Triangular';
                 case 4
-                    logMessage('Lens is driven in Retangular mode');
+                    lens.mode = 'Retangular';
                 case 5
-                    logMessage('Lens is driven in FocalPower mode');
+                    lens.mode = 'FocalPower';
                 case 6
-                    logMessage('Lens is driven in Analog mode');
+                    lens.mode = 'Analog';
                 case 7
-                    logMessage('Lens is driven in Position Controlled Mode');
+                    lens.mode = 'PositionControlled';
+            end
+            logMessage(sprintf('Lens is driven in %s mode', lens.mode));
+        end
+        
+        %% set the lens to different mode
+        function lens = modeCurrent(lens)
+            command = append_crc('MwDA'-0);
+            fwrite(lens.etl_port, command);
+            lens.last_time_laps = checkStatus(lens);
+            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
+            if strcmp(cellstr(char(lens.response(1:3))'), 'MDA')
+                logMessage('Lens set to Current Mode succesfully');
+                lens.mode = 'Current';
+            else
+                checkError(lens);
+            end
+        end
+        
+        function lens = modeSinusoidal(lens)
+            command = append_crc('MwSA'-0);
+            fwrite(lens.etl_port, command);
+            lens.last_time_laps = checkStatus(lens);
+            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
+            if strcmp(cellstr(char(lens.response(1:3))'), 'MSA')
+                logMessage('Lens set to Sinusoidal Signal Mode succesfully');
+                lens.mode = 'Sinusoidal';
+            else
+                checkError(lens);
+            end
+            lens = lens.setModeFrequency(lens.modeFrequency);
+            lens = lens.setModeLowerCurrent(lens.modeLowerCurrent);
+            lens = lens.setModeUpperCurrent(lens.modeUpperCurrent);
+        end
+        
+        function lens = modeTriangular(lens)
+            command = append_crc('MwTA'-0);
+            fwrite(lens.etl_port, command);
+            lens.last_time_laps = checkStatus(lens);
+            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
+            if strcmp(cellstr(char(lens.response(1:3))'), 'MTA')
+                logMessage('Lens set to Triangular Signal Mode succesfully');
+                lens.mode = 'Triangular';
+            else
+                checkError(lens);
+            end
+            lens = lens.setModeFrequency(lens.modeFrequency);
+            lens = lens.setModeLowerCurrent(lens.modeLowerCurrent);
+            lens = lens.setModeUpperCurrent(lens.modeUpperCurrent);
+        end
+        
+        function lens = modeRectangular(lens)
+            command = append_crc('MwQA'-0);
+            fwrite(lens.etl_port, command);
+            lens.last_time_laps = checkStatus(lens);
+            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
+            if strcmp(cellstr(char(lens.response(1:3))'), 'MQA')
+                logMessage('Lens set to Rectangular Signal Mode succesfully');
+                lens.mode = 'Retangular';
+            else
+                checkError(lens);
+            end
+            lens = lens.setModeFrequency(lens.modeFrequency);
+            lens = lens.setModeLowerCurrent(lens.modeLowerCurrent);
+            lens = lens.setModeUpperCurrent(lens.modeUpperCurrent);
+        end
+        
+        function lens = modeFocalPower(lens)
+            % Set some default temperature limits if not already set (in C)
+            if isnan(lens.focal_power_limits(1))
+                lens = lens.setTemperatureLimits([20, 45]);
+            end
+            
+            command = append_crc('MwCA'-0);
+            fwrite(lens.etl_port, command);
+            lens.last_time_laps = checkStatus(lens);
+            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
+            if strcmp(cellstr(char(lens.response(1:3))'), 'MCA')
+                logMessage('Lens set to Focal Power Mode succesfully');
+                lens.mode = 'FocalPower';
+            else
+                checkError(lens);
+            end
+        end
+        
+        function lens = modeAnalog(lens)
+            command = append_crc('MwAA'-0);
+            fwrite(lens.etl_port, command);
+            lens.last_time_laps = checkStatus(lens);
+            lens.response = fread(lens.etl_port,lens.etl_port.BytesAvailable);
+            if strcmp(cellstr(char(lens.response(1:3))'), 'MAA')
+                logMessage('Lens set to Analog Mode succesfully');
+                lens.mode = 'Analog';
+            else
+                checkError(lens);
             end
         end
         
@@ -273,8 +349,6 @@ classdef Optotune < handle
                 logMessage('Error occurred when setting modeUpperCurrent');
             end
             
-
-                
             getModeUpperCurrent(lens);
         end
         
@@ -389,8 +463,10 @@ classdef Optotune < handle
         
         %%  Closing the port when finished using it %%%%%%%%%%%%
         function lens = Close(lens)
-            lens = lens.currentMode();
+            lens = lens.modeCurrent();
             lens.setCurrent(0);
+            while ~strcmp(lens.etl_port.TransferStatus, 'idle')
+            end
             fclose(lens.etl_port);
             delete(lens.etl_port);
             clear lens.etl_port
